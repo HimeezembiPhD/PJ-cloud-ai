@@ -1,4 +1,6 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+
 from pydantic import BaseModel
 import os
 from typing import Dict, List, Literal, Optional
@@ -264,5 +266,171 @@ def chat(req: ChatRequest):
     SESSIONS[session_id].append({"role": "assistant", "content": reply})
 
     return {"assistant": "PJ", "reply": reply, "session_id": session_id}
+
+
+# html section
+CHAT_UI_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>PJ</title>
+  <style>
+    :root{color-scheme:dark}
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b0f19;color:#e8e8e8}
+    .wrap{max-width:880px;margin:0 auto;padding:16px}
+    .top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:12px 0}
+    .brand{display:flex;align-items:center;gap:10px}
+    .dot{width:10px;height:10px;border-radius:99px;background:#16a34a;box-shadow:0 0 0 4px rgba(22,163,74,.15)}
+    .title{font-weight:700;font-size:20px}
+    .muted{opacity:.75;font-size:12px}
+    .card{background:#121a2a;border:1px solid #1f2a44;border-radius:18px;overflow:hidden}
+    .msgs{height:65vh;overflow:auto;padding:14px;background:#0f1626}
+    .row{display:flex;gap:10px;padding:12px;border-top:1px solid #1f2a44;background:#121a2a}
+    input{flex:1;padding:12px 12px;border-radius:14px;border:1px solid #24314f;background:#0f1626;color:#fff;outline:none}
+    button{padding:12px 14px;border-radius:14px;border:0;background:#2a64ff;color:#fff;cursor:pointer;font-weight:600}
+    button.secondary{background:#1b2438;border:1px solid #24314f}
+    button:disabled{opacity:.6;cursor:not-allowed}
+    .msg{margin:10px 0;display:flex}
+    .me{justify-content:flex-end}
+    .pj{justify-content:flex-start}
+    .bubble{max-width:78%;padding:10px 12px;border-radius:16px;line-height:1.4;white-space:pre-wrap;word-wrap:break-word}
+    .me .bubble{background:#2a64ff}
+    .pj .bubble{background:#1b2438}
+    a{color:#9bb7ff}
+    .typing{opacity:.7;font-size:13px;margin:6px 0 0 2px}
+    .pill{padding:4px 8px;border:1px solid #24314f;border-radius:999px;font-size:12px;opacity:.85}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand">
+        <div class="dot"></div>
+        <div>
+          <div class="title">PJ</div>
+          <div class="muted">Jarvis-mode (cloud)</div>
+        </div>
+      </div>
+      <div class="pill">Session: <span id="sid"></span></div>
+    </div>
+
+    <div class="card">
+      <div id="msgs" class="msgs"></div>
+      <div class="row">
+        <input id="text" placeholder="Message PJ…" autocomplete="off" />
+        <button id="send">Send</button>
+        <button id="clear" class="secondary" title="Clear chat">Clear</button>
+      </div>
+    </div>
+
+    <div id="typing" class="typing" style="display:none;">PJ is typing…</div>
+  </div>
+
+<script>
+  const msgs = document.getElementById("msgs");
+  const text = document.getElementById("text");
+  const send = document.getElementById("send");
+  const clearBtn = document.getElementById("clear");
+  const typing = document.getElementById("typing");
+
+  // Persist session id + messages in browser
+  let sessionId = localStorage.getItem("pj_session_id");
+  if(!sessionId){
+    sessionId = "s_" + Math.random().toString(36).slice(2);
+    localStorage.setItem("pj_session_id", sessionId);
+  }
+  document.getElementById("sid").textContent = sessionId;
+
+  let history = JSON.parse(localStorage.getItem("pj_ui_history") || "[]");
+
+  function linkify(str){
+    // simple URL linkify
+    return str.replace(/(https?:\\/\\/[^\\s]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+  }
+
+  function addBubble(who, content){
+    const div = document.createElement("div");
+    div.className = "msg " + who;
+
+    const b = document.createElement("div");
+    b.className = "bubble";
+    b.innerHTML = linkify(content).replace(/\\n/g, "<br/>");
+
+    div.appendChild(b);
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+
+    history.push({ who, content });
+    localStorage.setItem("pj_ui_history", JSON.stringify(history.slice(-200)));
+  }
+
+  function renderSaved(){
+    msgs.innerHTML = "";
+    if(history.length === 0){
+      addBubble("pj", "Hey 🙂 I’m PJ. What do you want to do today?");
+      return;
+    }
+    for(const m of history){
+      addBubble(m.who, m.content);
+    }
+  }
+
+  async function sendMsg(){
+    const m = text.value.trim();
+    if(!m) return;
+
+    text.value = "";
+    addBubble("me", m);
+
+    send.disabled = true;
+    typing.style.display = "block";
+
+    try{
+      const res = await fetch("/chat", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ session_id: sessionId, message: m })
+      });
+
+      const data = await res.json();
+      if(!res.ok){
+        addBubble("pj", "Error: " + (data.detail || res.statusText));
+      }else{
+        addBubble("pj", data.reply || "(no reply)");
+      }
+    }catch(e){
+      addBubble("pj", "Network error: " + e.message);
+    }finally{
+      typing.style.display = "none";
+      send.disabled = false;
+      text.focus();
+    }
+  }
+
+  send.onclick = sendMsg;
+  text.addEventListener("keydown", (e) => {
+    if(e.key === "Enter") sendMsg();
+  });
+
+  clearBtn.onclick = () => {
+    history = [];
+    localStorage.removeItem("pj_ui_history");
+    msgs.innerHTML = "";
+    addBubble("pj", "Chat cleared. What do you want to do now?");
+  };
+
+  renderSaved();
+  text.focus();
+</script>
+</body>
+</html>
+"""
+
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    return CHAT_UI_HTML
+
 
 
