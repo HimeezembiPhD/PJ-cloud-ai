@@ -108,7 +108,9 @@ def should_search_web(user_msg: str) -> bool:
     triggers = [
         "search", "find", "look up", "lookup", "where can i",
         "official website", "official link", "directory", "providers",
-        "clinic", "contact", "phone number", "address", "near me"
+        "clinic", "contact", "phone number", "address", "near me",
+    "job", "jobs", "hiring", "vacancy", "vacancies", "stellenangebot",
+    "stellenangebote", "reinigungskraft", "gebäudereinigung", "bewerben"
     ]
     return any(t in text for t in triggers)
 
