@@ -428,9 +428,9 @@ CHAT_UI_HTML = """
 </html>
 """
 
-@app.get("/ui", response_class=HTMLResponse)
-def ui():
-    return CHAT_UI_HTML
+#@app.get("/ui", response_class=HTMLResponse)
+#def ui():
+ #   return CHAT_UI_HTML
 
 
 
