@@ -222,4 +222,45 @@ def chat(req: ChatRequest):
     if session_id not in SESSIONS:
         SESSIONS[session_id] = [{"role": "system", "content": PJ_SYSTEM_PROMPT}]
 
-    history = SESSIONS[s]()
+    history = SESSIONS[session_id]
+
+    # Optional: fetch web results and inject into context
+    web_context: Optional[str] = None
+    if should_search_web(msg):
+        try:
+            results = ddg_search(msg, limit=5)
+            if results:
+                lines = [f"- {r['title']} — {r['url']}" for r in results]
+                web_context = "Web search results (use these links; do not invent links):\n" + "\n".join(lines)
+        except Exception:
+            web_context = None
+
+    # Append user message
+    history.append({"role": "user", "content": msg})
+
+    # If we have web results, add them
+    if web_context:
+        history.append({"role": "system", "content": web_context})
+
+    # Trim history (keep system + last MAX_TURNS*2 messages)
+    system_msg = history[0]
+    recent = history[1:][-MAX_TURNS * 2 :]
+    history = [system_msg] + recent
+    SESSIONS[session_id] = history
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=history,
+            temperature=0.7,
+        )
+        reply = response.choices[0].message.content or ""
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OpenAI request failed: {str(e)}")
+
+    # Append assistant reply
+    SESSIONS[session_id].append({"role": "assistant", "content": reply})
+
+    return {"assistant": "PJ", "reply": reply, "session_id": session_id}
+
+
