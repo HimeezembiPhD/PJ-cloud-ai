@@ -2,8 +2,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import os
-from typing import Dict, List, Literal, Optional
-
+import time
+from typing import Dict, List, Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 from openai import OpenAI
 
-app = FastAPI(title="PJ Cloud AI", version="1.4.0")
+app = FastAPI(title="PJ Cloud AI", version="1.6.0")
 
 PJ_SYSTEM_PROMPT = """
 You are PJ, a helpful personal companion AI.
@@ -27,7 +27,6 @@ Rules:
 - If a request is about medical or legal resources, provide safe guidance and official links instead of refusing completely.
 """.strip()
 
-# City -> timezone (IANA timezones)
 CITY_TZ = {
     "windhoek": "Africa/Windhoek",
     "london": "Europe/London",
@@ -47,6 +46,35 @@ CITY_TZ = {
     "sydney": "Australia/Sydney",
 }
 
+# ---- sessions (in-memory MVP) ----
+SESSIONS: Dict[str, List[dict]] = {}
+SESSION_META: Dict[str, float] = {}  # session_id -> last_seen_epoch
+
+MAX_TURNS = 20
+DEFAULT_SEARCH_LIMIT = 5
+SESSION_TTL_SECONDS = int(os.getenv("PJ_SESSION_TTL_SECONDS", str(6 * 60 * 60)))
+CLEANUP_INTERVAL_SECONDS = 60
+_last_cleanup = 0.0
+
+
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
+
+
+def _cleanup_sessions_if_needed() -> None:
+    global _last_cleanup
+    now = time.time()
+    if now - _last_cleanup < CLEANUP_INTERVAL_SECONDS:
+        return
+    _last_cleanup = now
+
+    dead = [sid for sid, last_seen in SESSION_META.items() if now - last_seen > SESSION_TTL_SECONDS]
+    for sid in dead:
+        SESSION_META.pop(sid, None)
+        SESSIONS.pop(sid, None)
+
+
 def current_time_for(place: str) -> Optional[str]:
     key = place.strip().lower()
     tz = CITY_TZ.get(key)
@@ -59,45 +87,32 @@ def current_time_for(place: str) -> Optional[str]:
         return None
 
 
-Role = Literal["system", "user", "assistant"]
+def extract_place_for_time_question(text: str) -> Optional[str]:
+    t = text.lower().strip()
+    patterns = ["current time in", "time in", "what time is it in"]
+    for p in patterns:
+        if p in t:
+            place = t.split(p, 1)[1].strip().strip(" ?!.,")
+            if "," in place:
+                place = place.split(",", 1)[0].strip()
 
-# In-memory store: resets if Render restarts (good for MVP)
-SESSIONS: Dict[str, List[dict]] = {}
-MAX_TURNS = 20  # keep last 20 user+assistant turns to control token usage
-DEFAULT_SEARCH_LIMIT = 5
+            aliases = {
+                "nyc": "new york",
+                "new york city": "new york",
+                "la": "los angeles",
+                "l.a.": "los angeles",
+            }
+            if place in aliases:
+                return aliases[place]
 
-
-class ChatRequest(BaseModel):
-    session_id: str
-    message: str
-
-
-def ddg_search(query: str, limit: int = DEFAULT_SEARCH_LIMIT) -> List[dict]:
-    """Simple web search using DuckDuckGo HTML results."""
-    q = query.strip()
-    if not q:
-        return []
-
-    url = f"https://duckduckgo.com/html/?q={quote(q)}"
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; PJCloudAI/1.0)"}
-
-    with httpx.Client(timeout=20.0, headers=headers, follow_redirects=True) as client:
-        r = client.get(url)
-        r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "lxml")
-    results: List[dict] = []
-
-    for a in soup.select("a.result__a"):
-        title = a.get_text(strip=True)
-        href = a.get("href")
-        if not title or not href:
-            continue
-        results.append({"title": title, "url": href})
-        if len(results) >= limit:
-            break
-
-    return results
+            parts = place.split()
+            for n in (3, 2, 1):
+                if len(parts) >= n:
+                    cand = " ".join(parts[:n])
+                    if cand in CITY_TZ:
+                        return cand
+            return place
+    return None
 
 
 def should_search_web(user_msg: str) -> bool:
@@ -112,90 +127,99 @@ def should_search_web(user_msg: str) -> bool:
     return any(t in text for t in triggers)
 
 
-def extract_place_for_time_question(text: str) -> Optional[str]:
-    t = text.lower().strip()
-    patterns = ["current time in", "time in", "what time is it in"]
+async def ddg_search(query: str, limit: int = DEFAULT_SEARCH_LIMIT) -> List[dict]:
+    q = query.strip()
+    if not q:
+        return []
+    url = f"https://duckduckgo.com/html/?q={quote(q)}"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; PJCloudAI/1.0)"}
 
-    for p in patterns:
-        if p in t:
-            place = t.split(p, 1)[1].strip().strip(" ?!.,")
-            if place.startswith("new york"):
-                return "new york"
-            if "," in place:
-                place = place.split(",", 1)[0].strip()
-            parts = place.split()
-            if len(parts) >= 2:
-                two = " ".join(parts[:2])
-                if two in CITY_TZ:
-                    return two
-                return parts[0]
-            return place
-    return None
+    async with httpx.AsyncClient(timeout=20.0, headers=headers, follow_redirects=True) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")  # no lxml dependency
+    results: List[dict] = []
+
+    for a in soup.select("a.result__a"):
+        title = a.get_text(strip=True)
+        href = a.get("href")
+        if not title or not href:
+            continue
+        results.append({"title": title, "url": href})
+        if len(results) >= limit:
+            break
+    return results
 
 
 @app.get("/")
-def root():
+async def root():
     return {"assistant": "PJ", "status": "online"}
 
 
 @app.get("/health")
-def health():
+async def health():
     return {"ok": True}
 
 
 @app.get("/search")
-def search(q: str, limit: int = DEFAULT_SEARCH_LIMIT):
+async def search(q: str, limit: int = DEFAULT_SEARCH_LIMIT):
+    _cleanup_sessions_if_needed()
+
     if not q.strip():
         raise HTTPException(status_code=400, detail="q is required")
-    limit = max(1, min(int(limit), 10))
     try:
-        results = ddg_search(q, limit=limit)
+        limit_i = int(limit)
+    except Exception:
+        limit_i = DEFAULT_SEARCH_LIMIT
+    limit_i = max(1, min(limit_i, 10))
+
+    try:
+        results = await ddg_search(q, limit=limit_i)
         return {"query": q, "results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 
 @app.post("/chat")
-def chat(req: ChatRequest):
+async def chat(req: ChatRequest):
+    _cleanup_sessions_if_needed()
+
     msg = (req.message or "").strip()
     session_id = (req.session_id or "").strip()
-
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id is required")
+
+    SESSION_META[session_id] = time.time()
 
     if not msg:
         return {"assistant": "PJ", "reply": "Say something and I’m here 🙂", "session_id": session_id}
 
-    # World-clock questions handled directly
+    # World-clock direct handling
     place = extract_place_for_time_question(msg)
     if place:
         t = current_time_for(place)
         if t:
             return {"assistant": "PJ", "reply": f"The current time in {place.title()} is: {t}", "session_id": session_id}
         known = ", ".join(sorted(CITY_TZ.keys())[:12]) + " ..."
-        return {
-            "assistant": "PJ",
-            "reply": f"I don’t know the timezone for '{place}'. Try one of these: {known}",
-            "session_id": session_id
-        }
+        return {"assistant": "PJ", "reply": f"I don’t know the timezone for '{place}'. Try: {known}", "session_id": session_id}
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY missing in Render env vars")
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY missing in env vars")
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     client = OpenAI(api_key=api_key)
 
     if session_id not in SESSIONS:
         SESSIONS[session_id] = [{"role": "system", "content": PJ_SYSTEM_PROMPT}]
-
     history = SESSIONS[session_id]
 
-    # Optional web search context
+    # best-effort web context (do NOT store)
     web_context: Optional[str] = None
     if should_search_web(msg):
         try:
-            results = ddg_search(msg, limit=5)
+            results = await ddg_search(msg, limit=5)
             if results:
                 lines = [f"- {r['title']} — {r['url']}" for r in results]
                 web_context = "Web search results (use these links; do not invent links):\n" + "\n".join(lines)
@@ -203,37 +227,41 @@ def chat(req: ChatRequest):
             web_context = None
 
     history.append({"role": "user", "content": msg})
-    if web_context:
-        history.append({"role": "system", "content": web_context})
 
-    # Trim history
+    # trim stored conversation only
     system_msg = history[0]
     recent = history[1:][-MAX_TURNS * 2:]
     history = [system_msg] + recent
     SESSIONS[session_id] = history
 
+    messages_for_request = list(history)
+    if web_context:
+        messages_for_request.append({"role": "system", "content": web_context})
+
     try:
-        response = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=model,
-            messages=history,
+            messages=messages_for_request,
             temperature=0.7,
         )
-        reply = response.choices[0].message.content or ""
+        reply = resp.choices[0].message.content or ""
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OpenAI request failed: {str(e)}")
 
     SESSIONS[session_id].append({"role": "assistant", "content": reply})
+    SESSION_META[session_id] = time.time()
+
     return {"assistant": "PJ", "reply": reply, "session_id": session_id}
 
 
-# -------------------- UI (Text + Voice) --------------------
+# -------------------- UI (Text + Voice where supported) --------------------
 
-CHAT_UI_HTML = """
+CHAT_UI_HTML = r"""
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
   <title>PJ</title>
   <style>
     :root{color-scheme:dark}
@@ -245,7 +273,7 @@ CHAT_UI_HTML = """
     .title{font-weight:700;font-size:20px}
     .muted{opacity:.75;font-size:12px}
     .card{background:#121a2a;border:1px solid #1f2a44;border-radius:18px;overflow:hidden}
-    .msgs{height:65vh;overflow:auto;padding:14px;background:#0f1626}
+    .msgs{height:65vh;overflow:auto;padding:14px;background:#0f1626;scroll-behavior:smooth}
     .row{display:flex;gap:10px;padding:12px;border-top:1px solid #1f2a44;background:#121a2a}
     input{flex:1;padding:12px 12px;border-radius:14px;border:1px solid #24314f;background:#0f1626;color:#fff;outline:none}
     button{padding:12px 14px;border-radius:14px;border:0;background:#2a64ff;color:#fff;cursor:pointer;font-weight:600}
@@ -260,6 +288,8 @@ CHAT_UI_HTML = """
     a{color:#9bb7ff}
     .typing{opacity:.7;font-size:13px;margin:6px 0 0 2px}
     .pill{padding:4px 8px;border:1px solid #24314f;border-radius:999px;font-size:12px;opacity:.85}
+    .banner{margin:10px 0;padding:10px 12px;border:1px solid #24314f;background:#0f1626;border-radius:14px;font-size:13px;opacity:.9;display:none}
+    .banner strong{font-weight:700}
   </style>
 </head>
 <body>
@@ -269,17 +299,19 @@ CHAT_UI_HTML = """
         <div class="dot"></div>
         <div>
           <div class="title">PJ</div>
-          <div class="muted">Voice + Text</div>
+          <div class="muted">Text everywhere • Voice where supported</div>
         </div>
       </div>
       <div class="pill">Session: <span id="sid"></span></div>
     </div>
 
+    <div id="banner" class="banner"></div>
+
     <div class="card">
       <div id="msgs" class="msgs"></div>
       <div class="row">
         <button id="mic" class="secondary" title="Talk">🎤</button>
-        <input id="text" placeholder="Message PJ…" autocomplete="off" />
+        <input id="text" placeholder="Message PJ…" autocomplete="off" inputmode="text" />
         <button id="send">Send</button>
         <button id="speak" class="secondary" title="PJ voice on/off">🔊 On</button>
         <button id="clear" class="secondary" title="Clear chat">Clear</button>
@@ -295,8 +327,10 @@ CHAT_UI_HTML = """
   const send = document.getElementById("send");
   const clearBtn = document.getElementById("clear");
   const typing = document.getElementById("typing");
+  const banner = document.getElementById("banner");
+  const micBtn = document.getElementById("mic");
 
-  // Persist session id + messages in browser
+  // --- Session id ---
   let sessionId = localStorage.getItem("pj_session_id");
   if(!sessionId){
     sessionId = "s_" + Math.random().toString(36).slice(2);
@@ -306,8 +340,17 @@ CHAT_UI_HTML = """
 
   let history = JSON.parse(localStorage.getItem("pj_ui_history") || "[]");
 
-  function linkify(str){
-    return str.replace(/(https?:\\/\\/[^\\s]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+  // --- XSS-safe: escape first, then linkify ---
+  function escapeHtml(str){
+    return String(str)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+  function linkify(escapedStr){
+    return escapedStr.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
   }
 
   function addBubble(who, content){
@@ -316,7 +359,9 @@ CHAT_UI_HTML = """
 
     const b = document.createElement("div");
     b.className = "bubble";
-    b.innerHTML = linkify(content).replace(/\\n/g, "<br/>");
+
+    const safe = linkify(escapeHtml(content)).replace(/\n/g, "<br/>");
+    b.innerHTML = safe;
 
     div.appendChild(b);
     msgs.appendChild(div);
@@ -332,12 +377,15 @@ CHAT_UI_HTML = """
       addBubble("pj", "Hey 🙂 I’m PJ. Talk or type to start.");
       return;
     }
-    for(const m of history){
+    // render without re-saving
+    const saved = history.slice();
+    history = [];
+    for(const m of saved){
       addBubble(m.who, m.content);
     }
   }
 
-  // ---- Voice Out (TTS) ----
+  // ---- Voice Out (TTS): widely supported, but voices vary ----
   let voiceOn = localStorage.getItem("pj_voice_on") !== "false";
   const speakBtn = document.getElementById("speak");
   function updateSpeakBtn(){ speakBtn.textContent = voiceOn ? "🔊 On" : "🔇 Off"; }
@@ -353,23 +401,39 @@ CHAT_UI_HTML = """
   function speak(textToSpeak){
     if(!voiceOn) return;
     if(!window.speechSynthesis) return;
-    const u = new SpeechSynthesisUtterance(textToSpeak);
+    const u = new SpeechSynthesisUtterance(String(textToSpeak || ""));
     u.rate = 1.0;
     u.pitch = 1.0;
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(u);
   }
 
-  // ---- Voice In (STT) ----
-  const micBtn = document.getElementById("mic");
+  // ---- Voice In (STT): NOT universal. Use feature-detection + graceful fallback ----
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-
   let rec = null;
   let recognizing = false;
 
-  if (SpeechRecognition) {
+  function showBanner(msg){
+    banner.style.display = "block";
+    banner.innerHTML = msg;
+  }
+
+  const isSecure = location.protocol === "https:" || location.hostname === "localhost";
+
+  if (!SpeechRecognition) {
+    // Firefox/Safari typically: no STT
+    micBtn.disabled = true;
+    micBtn.title = "Voice input not supported in this browser";
+    showBanner("<strong>Note:</strong> Voice input isn’t supported in this browser. Text chat works everywhere.");
+  } else if (!isSecure) {
+    // STT requires HTTPS in most browsers
+    micBtn.disabled = true;
+    micBtn.title = "Voice input requires HTTPS";
+    showBanner("<strong>Note:</strong> Voice input needs <strong>HTTPS</strong>. Open this site via HTTPS to enable the mic.");
+  } else {
     rec = new SpeechRecognition();
-    rec.lang = "en-US";          // change to "de-DE" if you want German
+    // Prefer the browser language; user can change it later if needed
+    rec.lang = navigator.language || "en-US";
     rec.interimResults = true;
     rec.continuous = false;
 
@@ -386,7 +450,7 @@ CHAT_UI_HTML = """
     };
 
     rec.onerror = (e) => {
-      addBubble("pj", "Mic error: " + e.error + " (try Chrome/Edge)");
+      addBubble("pj", "Mic error: " + (e.error || "unknown") + " (try Chrome/Edge)");
     };
 
     rec.onresult = (event) => {
@@ -397,21 +461,19 @@ CHAT_UI_HTML = """
       text.value = transcript.trim();
     };
 
-    // Click to toggle recording
     micBtn.onclick = () => {
-      if (!recognizing) rec.start();
-      else rec.stop();
+      try{
+        if (!recognizing) rec.start();
+        else rec.stop();
+      }catch(e){
+        addBubble("pj", "Mic failed to start. Try reloading the page.");
+      }
     };
 
-    // Auto-send after talking
     rec.addEventListener("end", () => {
       const val = text.value.trim();
       if (val) sendMsg();
     });
-
-  } else {
-    micBtn.disabled = true;
-    micBtn.title = "Speech recognition not supported. Use Chrome/Edge.";
   }
 
   async function sendMsg(){
@@ -448,8 +510,13 @@ CHAT_UI_HTML = """
   }
 
   send.onclick = sendMsg;
+
+  // Better mobile behavior: Enter sends, Shift+Enter newline
   text.addEventListener("keydown", (e) => {
-    if(e.key === "Enter") sendMsg();
+    if(e.key === "Enter" && !e.shiftKey){
+      e.preventDefault();
+      sendMsg();
+    }
   });
 
   clearBtn.onclick = () => {
@@ -467,5 +534,5 @@ CHAT_UI_HTML = """
 """
 
 @app.get("/ui", response_class=HTMLResponse)
-def ui():
+async def ui():
     return CHAT_UI_HTML
